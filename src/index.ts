@@ -1,4 +1,4 @@
-import { getPoolReserves, getSwapInstruction, getSwapQuote, raydium } from './blockchain/raydium'
+import { getPoolReserves, getSwapInstruction, getSwapQuote } from './blockchain/raydium'
 import {
   Connection,
   Keypair,
@@ -19,7 +19,6 @@ import {
   getAccount,
   getAssociatedTokenAddressSync,
 } from '@solana/spl-token'
-import { initRaydiumSdk } from './blockchain/raydium'
 import { prepareWsolSwapInstructions } from './helpers/solana.helpers'
 import { AmmInfo, parseAmmInfo, RAYDIUM_V4_DEVNET_PROGRAM } from './blockchain/raydium/amm/src'
 
@@ -864,9 +863,6 @@ export class DEXFactory {
       case 'pumpswap':
         return new PumpSwapAdapter()
       case 'raydium': {
-        if (!raydium) {
-          initRaydiumSdk()
-        }
         return new RaydiumAdapter()
       }
       // case 'orca':
