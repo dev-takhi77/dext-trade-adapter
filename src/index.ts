@@ -1,8 +1,9 @@
-import { raydium } from './blockchain/raydium'
+import { getPoolReserves, getSwapInstruction, getSwapQuote, raydium } from './blockchain/raydium'
 import {
   Connection,
   Keypair,
   PublicKey,
+  sendAndConfirmTransaction,
   SystemProgram,
   Transaction,
   TransactionInstruction,
@@ -20,6 +21,7 @@ import {
 } from '@solana/spl-token'
 import { initRaydiumSdk } from './blockchain/raydium'
 import { prepareWsolSwapInstructions } from './helpers/solana.helpers'
+import { AmmInfo, parseAmmInfo, RAYDIUM_V4_DEVNET_PROGRAM } from './blockchain/raydium/amm/src'
 
 const PERCENT_BPS = 10_000n
 
@@ -32,7 +34,8 @@ export interface IDEXAdapter {
     outputMint: PublicKey,
     amountIn: bigint,
     amountOut: bigint,
-    slippage: number
+    slippage: number,
+    poolId: PublicKey
   ): Promise<{
     signature?: string
     error?: {
@@ -55,7 +58,8 @@ export interface IDEXAdapter {
     referralsFee: {
       wallet: PublicKey
       percent: number
-    }[]
+    }[],
+    poolId?: PublicKey
   ): Promise<{
     signature?: string
     error?: {
@@ -71,7 +75,8 @@ export interface IDEXAdapter {
     outputMint: PublicKey,
     amountIn: bigint,
     amountOut: bigint,
-    slippage: number
+    slippage: number,
+    poolId: PublicKey
   ): Promise<{
     signature?: string
     error?: {
@@ -94,7 +99,8 @@ export interface IDEXAdapter {
     referralsFee: {
       wallet: PublicKey
       percent: number
-    }[]
+    }[],
+    poolId: PublicKey
   ): Promise<{
     signature?: string
     error?: {
@@ -146,13 +152,22 @@ export interface IDEXAdapter {
 }
 
 export class RaydiumAdapter implements IDEXAdapter {
-  buyWithFees(
+  async buyWithFees(
     wallet: Keypair,
     inputMint: PublicKey,
     outputMint: PublicKey,
     amountIn: bigint,
     amountOut: bigint,
-    slippage: number
+    slippage: number,
+    serviceFee: {
+      wallet: PublicKey
+      percent: number
+    },
+    referralsFee: {
+      wallet: PublicKey
+      percent: number
+    }[],
+    poolId: PublicKey,
   ): Promise<{
     signature?: string
     error?: {
@@ -160,15 +175,85 @@ export class RaydiumAdapter implements IDEXAdapter {
       msg: string
     }
   }> {
-    throw new Error('Method not implemented.')
+    const connection = getSolanaConnection();
+
+    let poolInfo: AmmInfo | null = null;
+    const data = await connection.getAccountInfo(poolId);
+    if (data) {
+      poolInfo = parseAmmInfo(data.data);
+    }
+
+    if (!poolInfo?.baseVault || !poolInfo?.quoteVault || !poolInfo.baseMint || !poolInfo.quoteMint) {
+      return {
+        signature: undefined,
+        error: {
+          type: 1,
+          msg: 'Invalid pool information',
+        },
+      };
+    }
+
+    const reserve = await getPoolReserves(connection, poolInfo);
+
+    const minQuoteAmount = await getSwapQuote(Number(amountIn), inputMint.toBase58(), reserve, slippage)
+
+    const feeAmount =
+      (BigInt(minQuoteAmount) * BigInt(Math.floor(serviceFee.percent * 100))) / PERCENT_BPS +
+      890880n * BigInt(referralsFee.length) // 1e6 * 1.5 * 100 / 10000
+
+    const minAmountOut = BigInt(minQuoteAmount) - feeAmount;
+
+    const tx = new Transaction();
+
+    const ix = await getSwapInstruction(poolInfo, Number(amountIn), Number(minAmountOut), {
+      amm: new PublicKey(poolId),
+      ammCoinVault: poolInfo.baseVault,
+      ammPcVault: poolInfo.quoteVault,
+      ammProgram: RAYDIUM_V4_DEVNET_PROGRAM,
+      inputMint: new PublicKey(inputMint),
+      userSourceOwner: wallet.publicKey
+    }, "mainnet")
+
+    const ata = getAssociatedTokenAddressSync(outputMint, wallet.publicKey);
+
+    try {
+      await getAccount(connection, ata)
+    } catch (error) {
+      tx.add(
+        createAssociatedTokenAccountInstruction(
+          wallet.publicKey,
+          ata,
+          wallet.publicKey,
+          outputMint,
+          TOKEN_PROGRAM_ID,
+          ASSOCIATED_TOKEN_PROGRAM_ID
+        )
+      )
+    }
+
+    tx.add(ix);
+    addFeeToTx(tx, wallet.publicKey, feeAmount, serviceFee, referralsFee)
+
+    const result = await sendVtx(wallet, tx, [wallet], true)
+
+    return result
   }
-  sellWithFees(
+  async sellWithFees(
     wallet: Keypair,
     inputMint: PublicKey,
     outputMint: PublicKey,
     amountIn: bigint,
     amountOut: bigint,
-    slippage: number
+    slippage: number,
+    serviceFee: {
+      wallet: PublicKey
+      percent: number
+    },
+    referralsFee: {
+      wallet: PublicKey
+      percent: number
+    }[],
+    poolId: PublicKey,
   ): Promise<{
     signature?: string
     error?: {
@@ -176,15 +261,78 @@ export class RaydiumAdapter implements IDEXAdapter {
       msg: string
     }
   }> {
-    throw new Error('Method not implemented.')
+    const connection = getSolanaConnection();
+
+    let poolInfo: AmmInfo | null = null;
+    const data = await connection.getAccountInfo(poolId);
+    if (data) {
+      poolInfo = parseAmmInfo(data.data);
+    }
+
+    if (!poolInfo?.baseVault || !poolInfo?.quoteVault || !poolInfo.baseMint || !poolInfo.quoteMint) {
+      return {
+        signature: undefined,
+        error: {
+          type: 1,
+          msg: 'Invalid pool information',
+        },
+      };
+    }
+
+    const reserve = await getPoolReserves(connection, poolInfo);
+
+    const minQuoteAmount = await getSwapQuote(Number(amountIn), outputMint.toBase58(), reserve, slippage)
+
+    const feeAmount =
+      (BigInt(minQuoteAmount) * BigInt(Math.floor(serviceFee.percent * 100))) / PERCENT_BPS +
+      890880n * BigInt(referralsFee.length) // 1e6 * 1.5 * 100 / 10000
+
+    const minAmountOut = BigInt(minQuoteAmount) - feeAmount;
+
+    const tx = new Transaction();
+
+    const ix = await getSwapInstruction(poolInfo, Number(amountIn), Number(minAmountOut), {
+      amm: new PublicKey(poolId),
+      ammCoinVault: poolInfo.baseVault,
+      ammPcVault: poolInfo.quoteVault,
+      ammProgram: RAYDIUM_V4_DEVNET_PROGRAM,
+      inputMint: new PublicKey(outputMint),
+      userSourceOwner: wallet.publicKey
+    }, "mainnet")
+
+    const ata = getAssociatedTokenAddressSync(inputMint, wallet.publicKey);
+
+    try {
+      await getAccount(connection, ata)
+    } catch (error) {
+      tx.add(
+        createAssociatedTokenAccountInstruction(
+          wallet.publicKey,
+          ata,
+          wallet.publicKey,
+          outputMint,
+          TOKEN_PROGRAM_ID,
+          ASSOCIATED_TOKEN_PROGRAM_ID
+        )
+      )
+    }
+
+    tx.add(ix);
+    addFeeToTx(tx, wallet.publicKey, feeAmount, serviceFee, referralsFee)
+
+    const result = await sendVtx(wallet, tx, [wallet], true)
+
+    return result
   }
-  buy(
+
+  async buy(
     wallet: Keypair,
     inputMint: PublicKey,
     outputMint: PublicKey,
     amountIn: bigint,
     amountOut: bigint,
-    slippage: number
+    slippage: number,
+    poolId: PublicKey
   ): Promise<{
     signature?: string
     error?: {
@@ -192,15 +340,71 @@ export class RaydiumAdapter implements IDEXAdapter {
       msg: string
     }
   }> {
-    throw new Error('Method not implemented.')
+    const connection = getSolanaConnection();
+
+    let poolInfo: AmmInfo | null = null;
+    const data = await connection.getAccountInfo(poolId);
+    if (data) {
+      poolInfo = parseAmmInfo(data.data);
+    }
+
+    if (!poolInfo?.baseVault || !poolInfo?.quoteVault || !poolInfo.baseMint || !poolInfo.quoteMint) {
+      return {
+        signature: undefined,
+        error: {
+          type: 1,
+          msg: 'Invalid pool information',
+        },
+      };
+    }
+
+    const reserve = await getPoolReserves(connection, poolInfo);
+
+    const minQuoteAmount = await getSwapQuote(Number(amountIn), inputMint.toBase58(), reserve, slippage)
+
+    const tx = new Transaction();
+
+    const ix = await getSwapInstruction(poolInfo, Number(amountIn), minQuoteAmount, {
+      amm: new PublicKey(poolId),
+      ammCoinVault: poolInfo.baseVault,
+      ammPcVault: poolInfo.quoteVault,
+      ammProgram: RAYDIUM_V4_DEVNET_PROGRAM,
+      inputMint: new PublicKey(inputMint),
+      userSourceOwner: wallet.publicKey
+    }, "mainnet")
+
+    const ata = getAssociatedTokenAddressSync(outputMint, wallet.publicKey);
+
+    try {
+      await getAccount(connection, ata)
+    } catch (error) {
+      tx.add(
+        createAssociatedTokenAccountInstruction(
+          wallet.publicKey,
+          ata,
+          wallet.publicKey,
+          outputMint,
+          TOKEN_PROGRAM_ID,
+          ASSOCIATED_TOKEN_PROGRAM_ID
+        )
+      )
+    }
+
+    tx.add(ix);
+
+    const result = await sendVtx(wallet, tx, [wallet], true)
+
+    return result
   }
-  sell(
+
+  async sell(
     wallet: Keypair,
     inputMint: PublicKey,
     outputMint: PublicKey,
     amountIn: bigint,
     amountOut: bigint,
-    slippage: number
+    slippage: number,
+    poolId: PublicKey
   ): Promise<{
     signature?: string
     error?: {
@@ -208,7 +412,61 @@ export class RaydiumAdapter implements IDEXAdapter {
       msg: string
     }
   }> {
-    throw new Error('Method not implemented.')
+    const connection = getSolanaConnection();
+
+    let poolInfo: AmmInfo | null = null;
+    const data = await connection.getAccountInfo(poolId);
+    if (data) {
+      poolInfo = parseAmmInfo(data.data);
+    }
+
+    if (!poolInfo?.baseVault || !poolInfo?.quoteVault || !poolInfo.baseMint || !poolInfo.quoteMint) {
+      return {
+        signature: undefined,
+        error: {
+          type: 1,
+          msg: 'Invalid pool information',
+        },
+      };
+    }
+
+    const reserve = await getPoolReserves(connection, poolInfo);
+
+    const minQuoteAmount = await getSwapQuote(Number(amountIn), outputMint.toBase58(), reserve, slippage)
+
+    const tx = new Transaction();
+
+    const ix = await getSwapInstruction(poolInfo, Number(amountIn), minQuoteAmount, {
+      amm: new PublicKey(poolId),
+      ammCoinVault: poolInfo.baseVault,
+      ammPcVault: poolInfo.quoteVault,
+      ammProgram: RAYDIUM_V4_DEVNET_PROGRAM,
+      inputMint: new PublicKey(outputMint),
+      userSourceOwner: wallet.publicKey
+    }, "mainnet")
+
+    const ata = getAssociatedTokenAddressSync(inputMint, wallet.publicKey);
+
+    try {
+      await getAccount(connection, ata)
+    } catch (error) {
+      tx.add(
+        createAssociatedTokenAccountInstruction(
+          wallet.publicKey,
+          ata,
+          wallet.publicKey,
+          outputMint,
+          TOKEN_PROGRAM_ID,
+          ASSOCIATED_TOKEN_PROGRAM_ID
+        )
+      )
+    }
+
+    tx.add(ix);
+
+    const result = await sendVtx(wallet, tx, [wallet], true)
+
+    return result
   }
 
   buyIx(
@@ -631,7 +889,7 @@ export interface ISwapStrategy {
 }
 
 export class MarketSwapStrategy implements ISwapStrategy {
-  constructor(private slippage: number = 0.5) {}
+  constructor(private slippage: number = 0.5) { }
 
   async executeSwap(
     adapter: IDEXAdapter,
@@ -644,7 +902,7 @@ export class MarketSwapStrategy implements ISwapStrategy {
 }
 
 export class LimitSwapStrategy implements ISwapStrategy {
-  constructor(private targetPrice: number) {}
+  constructor(private targetPrice: number) { }
 
   async executeSwap(
     adapter: IDEXAdapter,
@@ -667,7 +925,7 @@ export class LimitSwapStrategy implements ISwapStrategy {
 }
 
 export class RetailStrategy implements ISwapStrategy {
-  constructor(private targetPrice: number) {}
+  constructor(private targetPrice: number) { }
 
   async executeSwap(
     adapter: IDEXAdapter,
