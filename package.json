@@ -22,8 +22,10 @@
   "dependencies": {
     "@pump-fun/pump-swap-sdk": "^0.0.1-beta.25",
     "@raydium-io/raydium-sdk-v2": "^0.1.128-alpha",
+    "@solana/spl-token": "0.4.8",
     "@solana/web3.js": "^1.98.0",
-    "bn.js": "^5.2.2"
+    "bn.js": "^5.2.2",
+    "decimal.js": "^10.5.0"
   },
   "devDependencies": {
     "@types/bn.js": "^5.1.6",
